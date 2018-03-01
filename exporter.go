@@ -69,6 +69,22 @@ var (
 		"rollbacks":                   "rollbacks",
 		"soft_autocommits":            "soft_autocommits",
 	}
+	gaugeUpdateRequestMetrics = map[string]string{
+		"15min_rate_reqs_per_second": "15min_rate_reqs_per_second",
+		"5min_rate_reqs_per_second":  "5min_rate_reqs_per_second",
+		"75th_pc_request_time":       "75th_pc_request_time",
+		"95th_pc_request_time":       "95th_pc_request_time",
+		"99th_pc_request_time":       "99th_pc_request_time",
+		"999th_pc_request_time":      "999th_pc_request_time",
+		"avg_requests_per_second":    "avg_requests_per_second",
+		"avg_time_per_request":       "avg_time_per_request",
+		"errors":                     "errors",
+		"handler_start":              "handler_start",
+		"median_request_time":        "median_request_time",
+		"requests":                   "requests",
+		"timeouts":                   "timeouts",
+		"total_time":                 "total_time",
+	}
 	gaugeCacheMetrics = map[string]string{
 		"cumulative_evictions": "cumulative_evictions",
 		"cumulative_hitratio":  "cumulative_hitratio",
@@ -103,11 +119,12 @@ type Exporter struct {
 
 	up prometheus.Gauge
 
-	gaugeAdmin  map[string]*prometheus.GaugeVec
-	gaugeCore   map[string]*prometheus.GaugeVec
-	gaugeQuery  map[string]*prometheus.GaugeVec
-	gaugeUpdate map[string]*prometheus.GaugeVec
-	gaugeCache  map[string]*prometheus.GaugeVec
+	gaugeAdmin         map[string]*prometheus.GaugeVec
+	gaugeCore          map[string]*prometheus.GaugeVec
+	gaugeQuery         map[string]*prometheus.GaugeVec
+	gaugeUpdate        map[string]*prometheus.GaugeVec
+	gaugeUpdateRequest map[string]*prometheus.GaugeVec
+	gaugeCache         map[string]*prometheus.GaugeVec
 
 	client *http.Client
 }
@@ -118,6 +135,7 @@ func NewExporter(solrURI string, solrContextPath string, timeout time.Duration, 
 	gaugeCore := make(map[string]*prometheus.GaugeVec, len(gaugeCoreMetrics))
 	gaugeQuery := make(map[string]*prometheus.GaugeVec, len(gaugeQueryMetrics))
 	gaugeUpdate := make(map[string]*prometheus.GaugeVec, len(gaugeUpdateMetrics))
+	gaugeUpdateRequest := make(map[string]*prometheus.GaugeVec, len(gaugeUpdateRequestMetrics))
 	gaugeCache := make(map[string]*prometheus.GaugeVec, len(gaugeCacheMetrics))
 
 	for name, help := range gaugeAdminMetrics {
@@ -151,6 +169,15 @@ func NewExporter(solrURI string, solrContextPath string, timeout time.Duration, 
 			Help:      help,
 		}, []string{"core", "handler", "class"})
 	}
+
+	for name, help := range gaugeUpdateRequestMetrics {
+		gaugeUpdateRequest[name] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace + "_updatehandler_request",
+			Name:      name,
+			Help:      help,
+		}, []string{"core", "handler", "class"})
+	}
+
 	for name, help := range gaugeCacheMetrics {
 		gaugeCache[name] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace + "_cache",
@@ -173,11 +200,12 @@ func NewExporter(solrURI string, solrContextPath string, timeout time.Duration, 
 			Help:      "Was the Solr instance query successful?",
 		}),
 
-		gaugeAdmin:  gaugeAdmin,
-		gaugeCore:   gaugeCore,
-		gaugeQuery:  gaugeQuery,
-		gaugeUpdate: gaugeUpdate,
-		gaugeCache:  gaugeCache,
+		gaugeAdmin:         gaugeAdmin,
+		gaugeCore:          gaugeCore,
+		gaugeQuery:         gaugeQuery,
+		gaugeUpdate:        gaugeUpdate,
+		gaugeUpdateRequest: gaugeUpdateRequest,
+		gaugeCache:         gaugeCache,
 
 		client: &http.Client{
 			Transport: &http.Transport{
@@ -213,6 +241,9 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	for _, vec := range e.gaugeUpdate {
 		vec.Describe(ch)
 	}
+	for _, vec := range e.gaugeUpdateRequest {
+		vec.Describe(ch)
+	}
 	for _, vec := range e.gaugeCache {
 		vec.Describe(ch)
 	}
@@ -235,6 +266,9 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		vec.Reset()
 	}
 	for _, vec := range e.gaugeUpdate {
+		vec.Reset()
+	}
+	for _, vec := range e.gaugeUpdateRequest {
 		vec.Reset()
 	}
 	for _, vec := range e.gaugeCache {
@@ -389,6 +423,44 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 			e.gaugeUpdate["soft_autocommits"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.SoftAutocommits))
 		}
 
+		updateRequestFixedNaNs := bytes.Replace(findMBeansData(mBeansData.SolrMbeans, "UPDATE"), []byte(":\"NaN\""), []byte(":0.0"), -1)
+		var updateRequestMetrics map[string]QueryHandler
+		if err := json.Unmarshal(updateRequestFixedNaNs, &updateRequestMetrics); err != nil {
+			log.Errorf("Failed to unmarshal mbeans update request metrics JSON into struct: %v, json : %s", err, b)
+			return
+		}
+
+		for name, metrics := range updateRequestMetrics {
+			// updateHandler has different stats, not requestTimes
+			if name == "updateHandler" {
+				continue
+			}
+
+			var FiveminRateRequestsPerSecond, One5minRateRequestsPerSecond float64
+			if metrics.Stats.One5minRateReqsPerSecond == nil && metrics.Stats.FiveMinRateReqsPerSecond == nil {
+				FiveminRateRequestsPerSecond = float64(metrics.Stats.FiveminRateRequestsPerSecond)
+				One5minRateRequestsPerSecond = float64(metrics.Stats.One5minRateRequestsPerSecond)
+			} else {
+				FiveminRateRequestsPerSecond = float64(*metrics.Stats.FiveMinRateReqsPerSecond)
+				One5minRateRequestsPerSecond = float64(*metrics.Stats.One5minRateReqsPerSecond)
+			}
+
+			e.gaugeUpdateRequest["15min_rate_reqs_per_second"].WithLabelValues(coreName, name, metrics.Class).Set(One5minRateRequestsPerSecond)
+			e.gaugeUpdateRequest["5min_rate_reqs_per_second"].WithLabelValues(coreName, name, metrics.Class).Set(FiveminRateRequestsPerSecond)
+			e.gaugeUpdateRequest["75th_pc_request_time"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.Seven5thPcRequestTime))
+			e.gaugeUpdateRequest["95th_pc_request_time"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.Nine5thPcRequestTime))
+			e.gaugeUpdateRequest["99th_pc_request_time"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.Nine9thPcRequestTime))
+			e.gaugeUpdateRequest["999th_pc_request_time"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.Nine99thPcRequestTime))
+			e.gaugeUpdateRequest["avg_requests_per_second"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.AvgRequestsPerSecond))
+			e.gaugeUpdateRequest["avg_time_per_request"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.AvgTimePerRequest))
+			e.gaugeUpdateRequest["errors"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.Errors))
+			e.gaugeUpdateRequest["handler_start"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.HandlerStart))
+			e.gaugeUpdateRequest["median_request_time"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.MedianRequestTime))
+			e.gaugeUpdateRequest["requests"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.Requests))
+			e.gaugeUpdateRequest["timeouts"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.Timeouts))
+			e.gaugeUpdateRequest["total_time"].WithLabelValues(coreName, name, metrics.Class).Set(float64(metrics.Stats.TotalTime))
+		}
+
 		// Try to decode solr > v5 cache metrics
 		cacheData := findMBeansData(mBeansData.SolrMbeans, "CACHE")
 		b = bytes.Replace(cacheData, []byte(":\"NaN\""), []byte(":0.0"), -1)
@@ -436,6 +508,9 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		vec.Collect(ch)
 	}
 	for _, vec := range e.gaugeUpdate {
+		vec.Collect(ch)
+	}
+	for _, vec := range e.gaugeUpdateRequest {
 		vec.Collect(ch)
 	}
 	for _, vec := range e.gaugeCache {
